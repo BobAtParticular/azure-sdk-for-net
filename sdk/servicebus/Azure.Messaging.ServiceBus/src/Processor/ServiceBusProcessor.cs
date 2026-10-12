@@ -133,6 +133,13 @@ namespace Azure.Messaging.ServiceBus
         public virtual int MaxConcurrentCalls => Options.MaxConcurrentCalls;
         private int _currentConcurrentCalls;
 
+        /// <summary>
+        /// The number of <see cref="_messageHandlerSemaphore"/> permits still to be reclaimed after concurrency was reduced.
+        /// Permits are reclaimed as the receive tasks holding them complete, rather than by blocking the scheduler. Only
+        /// accessed from the scheduler loop in <see cref="RunReceiveTaskAsync"/>.
+        /// </summary>
+        private int _messageHandlerPermitsOwed;
+
         internal int MaxConcurrentSessions => _maxConcurrentSessions;
         private volatile int _maxConcurrentSessions;
         private int _currentConcurrentSessions;
@@ -812,7 +819,7 @@ namespace Azure.Messaging.ServiceBus
         /// <param name="cancellationToken">A <see cref="CancellationToken"/> instance to signal the request to cancel the operation.</param>
         private async Task RunReceiveTaskAsync(CancellationToken cancellationToken)
         {
-            CancellationTokenSource linkedHandlerTcs = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _handlerCts.Token);
+            CancellationTokenSource linkedHandlerTcs = CreateLinkedHandlerTokenSource(cancellationToken);
 
             try
             {
@@ -827,7 +834,7 @@ namespace Azure.Messaging.ServiceBus
                         if (linkedHandlerTcs.IsCancellationRequested)
                         {
                             linkedHandlerTcs.Dispose();
-                            linkedHandlerTcs = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _handlerCts.Token);
+                            linkedHandlerTcs = CreateLinkedHandlerTokenSource(cancellationToken);
                             break;
                         }
 
@@ -842,10 +849,17 @@ namespace Azure.Messaging.ServiceBus
                             {
                                 linkedHandlerTcs.Dispose();
                                 // reset the linkedHandlerTcs if it was already cancelled due to user updating the concurrency
-                                linkedHandlerTcs = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _handlerCts.Token);
+                                linkedHandlerTcs = CreateLinkedHandlerTokenSource(cancellationToken);
                                 // allow the loop to wake up when tcs is signaled
                                 break;
                             }
+                        }
+
+                        // the permit belongs to a slot removed by a concurrency reduction, so keep it instead of starting a task
+                        if (_messageHandlerPermitsOwed > 0)
+                        {
+                            _messageHandlerPermitsOwed--;
+                            continue;
                         }
 
                         // hold onto all the tasks that we are starting so that when cancellation is requested,
@@ -1077,6 +1091,15 @@ namespace Azure.Messaging.ServiceBus
             }
         }
 
+        private CancellationTokenSource CreateLinkedHandlerTokenSource(CancellationToken cancellationToken)
+        {
+            // WakeLoop swaps and disposes _handlerCts while holding _optionsLock, so read it under the same lock.
+            lock (_optionsLock)
+            {
+                return CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _handlerCts.Token);
+            }
+        }
+
         private void WakeLoop()
         {
             // wake up the handler loop
@@ -1104,12 +1127,21 @@ namespace Azure.Messaging.ServiceBus
             // increasing concurrency
             if (diff > 0)
             {
-                _messageHandlerSemaphore.Release(diff);
+                // permits still owed from an earlier reduction cover part of the increase
+                int forgiven = Math.Min(diff, _messageHandlerPermitsOwed);
+                _messageHandlerPermitsOwed -= forgiven;
+                diff -= forgiven;
+
+                if (diff > 0)
+                {
+                    _messageHandlerSemaphore.Release(diff);
+                }
             }
             // decreasing concurrency
             else if (diff < 0)
             {
-                var activeTasks = TaskTuples.Where(t => !t.Task.IsCompleted).ToList();
+                // tasks cancelled by an earlier reduction may still be running a handler; don't count or cancel them again
+                var activeTasks = TaskTuples.Where(t => !t.Task.IsCompleted && !t.Cts.IsCancellationRequested).ToList();
                 int excessTasks = activeTasks.Count - maxConcurrentCalls;
 
                 // cancel excess tasks
@@ -1118,12 +1150,15 @@ namespace Azure.Messaging.ServiceBus
                     activeTasks[i].Cts.Cancel();
                 }
 
-                int diffLimit = Math.Abs(diff);
-                // limit the number of new tasks that can spawn to newly specified concurrency
-                for (int i = 0; i < diffLimit; i++)
-                {
-                    await _messageHandlerSemaphore.WaitAsync().ConfigureAwait(false);
-                }
+                // Limit the number of new tasks that can spawn to the newly specified concurrency. Permits held by cancelled
+                // tasks are reclaimed as those tasks complete. Waiting for them here would block the scheduler until every
+                // cancelled handler returns, which never happens if a handler doesn't observe its cancellation token.
+                _messageHandlerPermitsOwed += Math.Abs(diff);
+            }
+
+            while (_messageHandlerPermitsOwed > 0 && _messageHandlerSemaphore.Wait(0, CancellationToken.None))
+            {
+                _messageHandlerPermitsOwed--;
             }
 
             if (IsSessionProcessor)

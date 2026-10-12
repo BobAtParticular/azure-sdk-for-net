@@ -12,6 +12,9 @@
 
 ### Bugs Fixed
 
+- Fixed `ServiceBusProcessor` and `ServiceBusSessionProcessor` permanently losing concurrency, and potentially stopping all processing, when concurrency is reduced while a message handler that does not observe its cancellation token is still running. Reducing concurrency no longer blocks the processor until all cancelled handlers return.
+- Fixed a race where updating processor options could dispose the cancellation source used by the processing loop while it was linking to it.
+
 ### Other Changes
 
 ## 7.21.0 (2026-10-06)
