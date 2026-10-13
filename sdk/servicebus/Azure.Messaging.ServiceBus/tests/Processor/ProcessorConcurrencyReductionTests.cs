@@ -116,6 +116,8 @@ namespace Azure.Messaging.ServiceBus.Tests.Processor
                 {
                     Assert.Fail("The processor did not stop within 10 seconds.");
                 }
+
+                await dispose;
             }
         }
 
