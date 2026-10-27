@@ -22,18 +22,63 @@ namespace Azure.Messaging.ServiceBus.Tests.Processor
 
         private sealed class HandlerTracker
         {
+            private readonly object _handlerLock = new();
+            private readonly List<CancellationToken> _runningHandlerTokens = new();
+
             public int Running;
             public int MaxRunning;
             public int Hung;
             public long Receives;
             public long Sequence;
+            public int ObservedPrefetchCount;
+            public int NextPrefetchCount;
             public Func<long, bool> ShouldHang = _ => false;
             public readonly TaskCompletionSource<bool> ReleaseHungHandlers = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
+            public bool HasCancelledHandlers
+            {
+                get
+                {
+                    lock (_handlerLock)
+                    {
+                        return _runningHandlerTokens.Exists(token => token.IsCancellationRequested);
+                    }
+                }
+            }
+
+            public bool TryStartHandler(CancellationToken cancellationToken)
+            {
+                lock (_handlerLock)
+                {
+                    // A receive may deliver a message just as its task is cancelled. Do not start another ordinary handler.
+                    if (cancellationToken.IsCancellationRequested)
+                    {
+                        return false;
+                    }
+                    _runningHandlerTokens.Add(cancellationToken);
+                    int running = Interlocked.Increment(ref Running);
+                    MaxRunning = Math.Max(MaxRunning, running);
+                    return true;
+                }
+            }
+
+            public void CompleteHandler(CancellationToken cancellationToken)
+            {
+                lock (_handlerLock)
+                {
+                    _runningHandlerTokens.Remove(cancellationToken);
+                    Interlocked.Decrement(ref Running);
+                }
+            }
+
             public async Task MeasureAsync(TimeSpan duration)
             {
-                Volatile.Write(ref MaxRunning, Volatile.Read(ref Running));
-                Interlocked.Exchange(ref Receives, 0);
+                // Keep the peak reset atomic with handler entry/exit so a stale peak cannot cross measurement windows.
+                lock (_handlerLock)
+                {
+                    Interlocked.Exchange(ref MaxRunning, Volatile.Read(ref Running));
+                    Interlocked.Exchange(ref Receives, 0);
+                }
                 await Task.Delay(duration);
             }
         }
@@ -45,12 +90,10 @@ namespace Azure.Messaging.ServiceBus.Tests.Processor
             var processor = CreateProcessor(tracker);
             await using var cleanup = new ProcessorCleanup(processor, tracker);
             await processor.StartProcessingAsync();
-            await Task.Delay(500);
+            await AssertConcurrencyAsync(tracker, MaxConcurrentCalls);
 
-            await ReduceThenRestoreAsync(processor);
-            await tracker.MeasureAsync(TimeSpan.FromSeconds(2));
-
-            Assert.That(Volatile.Read(ref tracker.MaxRunning), Is.EqualTo(MaxConcurrentCalls));
+            await ReduceThenRestoreAsync(processor, tracker);
+            await AssertConcurrencyAsync(tracker, MaxConcurrentCalls);
         }
 
         [Test]
@@ -67,13 +110,10 @@ namespace Azure.Messaging.ServiceBus.Tests.Processor
             var processor = CreateProcessor(tracker);
             await using var cleanup = new ProcessorCleanup(processor, tracker);
             await processor.StartProcessingAsync();
-            await WaitForAsync(() => Volatile.Read(ref tracker.Hung) == hungHandlers);
+            await WaitForAsync(() => Volatile.Read(ref tracker.Hung) == hungHandlers, "The expected handlers did not enter the hung state.");
 
-            await ReduceThenRestoreAsync(processor);
-            await tracker.MeasureAsync(TimeSpan.FromSeconds(2));
-
-            Assert.That(Interlocked.Read(ref tracker.Receives), Is.GreaterThan(0), "the processor stopped receiving");
-            Assert.That(Volatile.Read(ref tracker.MaxRunning), Is.EqualTo(MaxConcurrentCalls - hungHandlers));
+            await ReduceThenRestoreAsync(processor, tracker);
+            await AssertConcurrencyAsync(tracker, MaxConcurrentCalls - hungHandlers);
         }
 
         [Test]
@@ -83,24 +123,99 @@ namespace Azure.Messaging.ServiceBus.Tests.Processor
             var processor = CreateProcessor(tracker);
             await using var cleanup = new ProcessorCleanup(processor, tracker);
             await processor.StartProcessingAsync();
-            await WaitForAsync(() => Volatile.Read(ref tracker.Hung) == 2);
+            await WaitForAsync(() => Volatile.Read(ref tracker.Hung) == 2, "The expected handlers did not enter the hung state.");
 
-            processor.UpdateConcurrency(1);
-            await Task.Delay(500);
+            await UpdateConcurrencyAndWaitAsync(processor, tracker, 1);
             tracker.ReleaseHungHandlers.TrySetResult(true);
-            await Task.Delay(200);
-            await tracker.MeasureAsync(TimeSpan.FromSeconds(2));
+            await AssertConcurrencyAsync(tracker, 1);
+        }
 
-            Assert.That(Interlocked.Read(ref tracker.Receives), Is.GreaterThan(0), "the processor stopped receiving");
-            Assert.That(Volatile.Read(ref tracker.MaxRunning), Is.EqualTo(1));
+        [Test]
+        public async Task RepeatedReductionsHonorLimitAndRecover(
+            [Values(1, 2, 3)] int hungHandlers,
+            [Values(0, 1, 2)] int firstHungSequenceOffset)
+        {
+            var tracker = new HandlerTracker
+            {
+                ShouldHang = sequence => sequence > firstHungSequenceOffset && sequence <= firstHungSequenceOffset + hungHandlers
+            };
+            var processor = CreateProcessor(tracker);
+            await using var cleanup = new ProcessorCleanup(processor, tracker);
+            await processor.StartProcessingAsync();
+            await WaitForAsync(() => Volatile.Read(ref tracker.Hung) == hungHandlers, "The expected handlers did not enter the hung state.");
+
+            foreach (int limit in new[] { 3, 2, 4, 2, 4 })
+            {
+                await UpdateConcurrencyAndWaitAsync(processor, tracker, limit);
+                if (limit == MaxConcurrentCalls)
+                {
+                    await AssertConcurrencyAsync(tracker, MaxConcurrentCalls - hungHandlers);
+                }
+                else
+                {
+                    // Already-running hung handlers cannot be forcibly stopped. Check the remaining handlers against
+                    // the new limit, including when hung handlers alone outnumber that limit.
+                    await AssertConcurrencyDoesNotExceedAsync(tracker, limit);
+                }
+            }
+        }
+
+        [Test]
+        public async Task StopAndRestartPreservesOwedPermits()
+        {
+            var tracker = new HandlerTracker { ShouldHang = sequence => sequence <= 2 };
+            var processor = CreateProcessor(tracker);
+            await using var cleanup = new ProcessorCleanup(processor, tracker);
+            await processor.StartProcessingAsync();
+            await WaitForAsync(() => Volatile.Read(ref tracker.Hung) == 2, "The expected handlers did not enter the hung state.");
+
+            await UpdateConcurrencyAndWaitAsync(processor, tracker, 1);
+            var stop = processor.StopProcessingAsync();
+            await WaitForAsync(() => Volatile.Read(ref tracker.Running) == 0, "Non-hung handlers did not stop.");
+            Assert.That(stop.IsCompleted, Is.False, "Stopping must wait for the hung handlers to return.");
+            tracker.ReleaseHungHandlers.TrySetResult(true);
+            await WaitForAsync(() => stop.IsCompleted, "The processor did not stop after the hung handlers returned.");
+            await stop;
+
+            await processor.StartProcessingAsync();
+            await AssertConcurrencyAsync(tracker, 1);
+            await UpdateConcurrencyAndWaitAsync(processor, tracker, 3);
+            await AssertConcurrencyAsync(tracker, 3);
+        }
+
+        [Test]
+        public async Task SessionProcessorRecoversWithHungHandlers()
+        {
+            var tracker = new HandlerTracker { ShouldHang = sequence => sequence <= 2 };
+            var processor = new ServiceBusSessionProcessor(
+                CreateConnection(tracker), "queue", new ServiceBusSessionProcessorOptions
+                {
+                    MaxConcurrentSessions = 1,
+                    MaxConcurrentCallsPerSession = MaxConcurrentCalls,
+                    SessionIds = { "session" },
+                    AutoCompleteMessages = false,
+                    MaxAutoLockRenewalDuration = TimeSpan.Zero,
+                });
+            processor.ProcessErrorAsync += _ => Task.CompletedTask;
+            processor.ProcessMessageAsync += args => ProcessMessageAsync(tracker, args.Message, args.CancellationToken);
+            await using var cleanup = new ProcessorCleanup(processor, tracker);
+            await processor.StartProcessingAsync();
+            await WaitForAsync(() => Volatile.Read(ref tracker.Hung) == 2, "The session handlers did not enter the hung state.");
+
+            processor.UpdateConcurrency(1, 1);
+            await WaitForReconciliationAsync(processor.InnerProcessor, tracker);
+            await AssertConcurrencyDoesNotExceedAsync(tracker, 1);
+            processor.UpdateConcurrency(1, MaxConcurrentCalls);
+            await WaitForReconciliationAsync(processor.InnerProcessor, tracker);
+            await AssertConcurrencyAsync(tracker, MaxConcurrentCalls - 2);
         }
 
         private sealed class ProcessorCleanup : IAsyncDisposable
         {
-            private readonly ServiceBusProcessor _processor;
+            private readonly IAsyncDisposable _processor;
             private readonly HandlerTracker _tracker;
 
-            public ProcessorCleanup(ServiceBusProcessor processor, HandlerTracker tracker)
+            public ProcessorCleanup(IAsyncDisposable processor, HandlerTracker tracker)
             {
                 _processor = processor;
                 _tracker = tracker;
@@ -121,24 +236,74 @@ namespace Azure.Messaging.ServiceBus.Tests.Processor
             }
         }
 
-        private static async Task ReduceThenRestoreAsync(ServiceBusProcessor processor)
+        private static async Task ReduceThenRestoreAsync(ServiceBusProcessor processor, HandlerTracker tracker)
         {
-            processor.UpdateConcurrency(1);
-            await Task.Delay(200);
-            processor.UpdateConcurrency(MaxConcurrentCalls);
-            await Task.Delay(500);
+            await UpdateConcurrencyAndWaitAsync(processor, tracker, 1);
+            await AssertConcurrencyDoesNotExceedAsync(tracker, 1);
+            await UpdateConcurrencyAndWaitAsync(processor, tracker, MaxConcurrentCalls);
         }
 
-        private static async Task WaitForAsync(Func<bool> condition)
+        private static async Task UpdateConcurrencyAndWaitAsync(ServiceBusProcessor processor, HandlerTracker tracker, int limit)
         {
-            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            processor.UpdateConcurrency(limit);
+            await WaitForReconciliationAsync(processor, tracker);
+        }
+
+        private static async Task WaitForReconciliationAsync(ServiceBusProcessor processor, HandlerTracker tracker)
+        {
+            // The transport prefetch setter runs after concurrency reconciliation. Use a distinct value as an observable
+            // acknowledgement instead of sleeping or reading the scheduler's private state. The mock does not prefetch.
+            int prefetchCount = ++tracker.NextPrefetchCount;
+            processor.UpdatePrefetchCount(prefetchCount);
+            await WaitForAsync(() => Volatile.Read(ref tracker.ObservedPrefetchCount) == prefetchCount,
+                "The processor did not reconcile the concurrency update.");
+        }
+
+        private static async Task AssertConcurrencyDoesNotExceedAsync(HandlerTracker tracker, int limit)
+        {
+            await WaitForAsync(() => !tracker.HasCancelledHandlers && Volatile.Read(ref tracker.Running) <= limit,
+                "Cancelled ordinary handlers did not return and settle below the reduced limit.");
+            await tracker.MeasureAsync(TimeSpan.FromMilliseconds(500));
+            Assert.That(Volatile.Read(ref tracker.MaxRunning), Is.LessThanOrEqualTo(limit), "Handlers exceeded the concurrency limit.");
+        }
+
+        private static async Task AssertConcurrencyAsync(HandlerTracker tracker, int expected)
+        {
+            await WaitForAsync(() => !tracker.HasCancelledHandlers && Volatile.Read(ref tracker.Running) == expected,
+                $"The processor did not reach {expected} concurrent non-hung handlers.");
+            await tracker.MeasureAsync(TimeSpan.FromMilliseconds(500));
+            Assert.That(Volatile.Read(ref tracker.MaxRunning), Is.LessThanOrEqualTo(expected), "Handlers exceeded the concurrency limit.");
+            Assert.That(Interlocked.Read(ref tracker.Receives), Is.GreaterThan(0), "The processor stopped receiving.");
+        }
+
+        private static async Task WaitForAsync(Func<bool> condition, string failureMessage)
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
             while (!condition())
             {
-                await Task.Delay(20, timeout.Token);
+                if (timeout.IsCancellationRequested)
+                {
+                    Assert.Fail(failureMessage);
+                }
+                await Task.Delay(10);
             }
         }
 
         private static ServiceBusProcessor CreateProcessor(HandlerTracker tracker)
+        {
+            var processor = new ServiceBusProcessor(CreateConnection(tracker), "queue", false, new ServiceBusProcessorOptions
+            {
+                MaxConcurrentCalls = MaxConcurrentCalls,
+                AutoCompleteMessages = false,
+                MaxAutoLockRenewalDuration = TimeSpan.Zero,
+            });
+
+            processor.ProcessErrorAsync += _ => Task.CompletedTask;
+            processor.ProcessMessageAsync += args => ProcessMessageAsync(tracker, args.Message, args.CancellationToken);
+            return processor;
+        }
+
+        private static ServiceBusConnection CreateConnection(HandlerTracker tracker)
         {
             var receiver = new Mock<TransportReceiver>();
             receiver
@@ -157,51 +322,43 @@ namespace Azure.Messaging.ServiceBus.Tests.Processor
                             lockedUntil: DateTimeOffset.UtcNow.AddMinutes(5))
                     };
                 });
+            receiver.SetupGet(r => r.SessionId).Returns("session");
+            receiver.SetupGet(r => r.SessionLockedUntil).Returns(() => DateTimeOffset.UtcNow.AddMinutes(5));
+            receiver.SetupSet(r => r.PrefetchCount = It.IsAny<int>())
+                .Callback<int>(count => Volatile.Write(ref tracker.ObservedPrefetchCount, count));
+            return ServiceBusTestUtilities.GetMockedReceiverConnection(receiver);
+        }
 
-            var connection = ServiceBusTestUtilities.CreateMockConnection();
-            connection
-                .Setup(c => c.CreateTransportReceiver(
-                    It.IsAny<string>(), It.IsAny<ServiceBusRetryPolicy>(), It.IsAny<ServiceBusReceiveMode>(),
-                    It.IsAny<uint>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<bool>(), It.IsAny<bool>(),
-                    It.IsAny<bool>(), It.IsAny<Guid?>(), It.IsAny<CancellationToken>()))
-                .Returns(receiver.Object);
-
-            var processor = new ServiceBusProcessor(connection.Object, "queue", false, new ServiceBusProcessorOptions
+        private static async Task ProcessMessageAsync(HandlerTracker tracker, ServiceBusReceivedMessage message, CancellationToken cancellationToken)
+        {
+            if (tracker.ShouldHang(message.SequenceNumber))
             {
-                MaxConcurrentCalls = MaxConcurrentCalls,
-                AutoCompleteMessages = false,
-                MaxAutoLockRenewalDuration = TimeSpan.Zero,
-            });
-
-            processor.ProcessErrorAsync += _ => Task.CompletedTask;
-            processor.ProcessMessageAsync += async args =>
-            {
-                if (tracker.ShouldHang(args.Message.SequenceNumber))
-                {
-                    Interlocked.Increment(ref tracker.Hung);
-                    // Like a handler blocked on I/O without a timeout: doesn't observe args.CancellationToken.
-                    await tracker.ReleaseHungHandlers.Task;
-                    return;
-                }
-
-                var running = Interlocked.Increment(ref tracker.Running);
-                int observed;
-                while (running > (observed = Volatile.Read(ref tracker.MaxRunning)) &&
-                       Interlocked.CompareExchange(ref tracker.MaxRunning, running, observed) != observed)
-                {
-                }
-
+                Interlocked.Increment(ref tracker.Hung);
                 try
                 {
-                    await Task.Delay(50);
+                    // Like a handler blocked on I/O without a timeout: does not observe the cancellation token.
+                    await tracker.ReleaseHungHandlers.Task;
                 }
                 finally
                 {
-                    Interlocked.Decrement(ref tracker.Running);
+                    Interlocked.Decrement(ref tracker.Hung);
                 }
-            };
+                return;
+            }
 
-            return processor;
+            if (!tracker.TryStartHandler(cancellationToken))
+            {
+                return;
+            }
+
+            try
+            {
+                await Task.Delay(50);
+            }
+            finally
+            {
+                tracker.CompleteHandler(cancellationToken);
+            }
         }
     }
 }
