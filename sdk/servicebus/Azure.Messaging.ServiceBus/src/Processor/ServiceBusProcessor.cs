@@ -135,8 +135,10 @@ namespace Azure.Messaging.ServiceBus
 
         /// <summary>
         /// The number of <see cref="_messageHandlerSemaphore"/> permits still to be reclaimed after concurrency was reduced.
-        /// Permits are reclaimed as the receive tasks holding them complete, rather than by blocking the scheduler. Only
-        /// accessed from the scheduler loop in <see cref="RunReceiveTaskAsync"/>.
+        /// Permits are reclaimed from the next permits released, rather than by blocking the scheduler. Only accessed
+        /// from the scheduler loop in <see cref="RunReceiveTaskAsync"/>. Preserve this counter across stops and starts:
+        /// after stopping, the semaphore holds _currentConcurrentCalls + owed permits, and the next run's first
+        /// reconciliation must drain the excess.
         /// </summary>
         private int _messageHandlerPermitsOwed;
 
@@ -1049,8 +1051,11 @@ namespace Azure.Messaging.ServiceBus
         /// When reducing concurrency, cancellation will be requested for in-progress message handlers that exceed the new concurrency limit via their associated
         /// <see cref="System.Threading.CancellationToken"/>. There is no guarantee as to which handlers will be cancelled. Handlers should observe the cancellation token passed via
         /// <see cref="ProcessMessageEventArgs.CancellationToken"/> and handle cancellation gracefully to avoid incomplete processing.
-        /// The cancellation is cooperative; handlers that do not observe the token will continue to run until they complete.
-        /// When increasing concurrency, the change takes effect immediately by allowing additional concurrent message handlers.
+        /// Cancellation is cooperative: handlers that do not observe the token may continue running above the new limit until they return.
+        /// Each continues to hold a receive permit, reducing the capacity available to start additional receive tasks, including after a subsequent increase.
+        /// Surviving receive tasks can continue processing messages. If all available receive tasks are blocked in handlers,
+        /// processing pauses until a handler returns or concurrency is raised.
+        /// Subsequent concurrency updates take effect without waiting for cancelled handlers to return.
         /// </remarks>
         public void UpdateConcurrency(int maxConcurrentCalls)
         {
@@ -1140,7 +1145,7 @@ namespace Azure.Messaging.ServiceBus
             // decreasing concurrency
             else if (diff < 0)
             {
-                // tasks cancelled by an earlier reduction may still be running a handler; don't count or cancel them again
+                // Consider only uncancelled tasks so cancellation does not depend on where previously cancelled tasks appear in the list.
                 var activeTasks = TaskTuples.Where(t => !t.Task.IsCompleted && !t.Cts.IsCancellationRequested).ToList();
                 int excessTasks = activeTasks.Count - maxConcurrentCalls;
 
@@ -1171,6 +1176,8 @@ namespace Azure.Messaging.ServiceBus
                 }
                 else
                 {
+                    // Accept permits are held only during session acceptance, bounded by the retry policy's timeouts and delays.
+                    // Unlike message handlers, these operations do not depend on user code completing.
                     int diffAcceptLimit = Math.Abs(diffAcceptSessions);
                     for (int i = 0; i < diffAcceptLimit; i++)
                     {

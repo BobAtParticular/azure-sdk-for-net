@@ -333,8 +333,12 @@ namespace Azure.Messaging.ServiceBus
         /// When reducing concurrency, cancellation will be requested for in-progress message handlers that exceed the new concurrency limit via their associated
         /// <see cref="System.Threading.CancellationToken"/>. There is no guarantee as to which handlers will be cancelled. Handlers should observe the cancellation token passed via
         /// <see cref="ProcessSessionMessageEventArgs.CancellationToken"/> and handle cancellation gracefully to avoid incomplete processing.
-        /// The cancellation is cooperative; handlers that do not observe the token will continue to run until they complete.
-        /// When increasing concurrency, the change takes effect immediately by allowing additional concurrent message handlers.
+        /// Cancellation is cooperative: handlers that do not observe the token may continue running above the new limit until they return.
+        /// Each continues to hold a receive permit, reducing the capacity available to start additional receive tasks, including after a subsequent increase.
+        /// Surviving receive tasks can continue processing messages. If all available receive tasks are blocked in handlers,
+        /// processing pauses until a handler returns or concurrency is raised.
+        /// Subsequent concurrency updates do not wait for cancelled handlers to return, but may wait for pending session acceptance
+        /// operations to finish within the configured retry policy's timeouts and delays.
         /// </remarks>
         public void UpdateConcurrency(int maxConcurrentSessions, int maxConcurrentCallsPerSession)
         {
